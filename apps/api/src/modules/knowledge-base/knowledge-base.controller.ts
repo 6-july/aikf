@@ -16,6 +16,7 @@ import {
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { CreateQaDto } from './dto/create-qa.dto';
+import { DuplicateCheckDto } from './dto/duplicate-check.dto';
 import { GenerateSimilarQuestionsDto } from './dto/generate-similar-questions.dto';
 import { ImportQaDto } from './dto/import-qa.dto';
 import { SearchKnowledgeBaseDto } from './dto/search-knowledge-base.dto';
@@ -121,5 +122,10 @@ export class KnowledgeBaseController {
   @Post('test-search')
   testSearch(@Body() dto: SearchKnowledgeBaseDto) {
     return this.knowledgeBaseService.search(dto, true);
+  }
+
+  @Post('duplicate-check')
+  checkDuplicates(@Body() dto: DuplicateCheckDto) {
+    return this.knowledgeBaseService.checkDuplicates(dto);
   }
 }

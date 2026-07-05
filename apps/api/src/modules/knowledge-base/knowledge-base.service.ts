@@ -2,6 +2,7 @@ import { BadRequestException, Injectable, NotFoundException, OnModuleInit } from
 import { randomUUID } from 'crypto';
 import * as XLSX from 'xlsx';
 import { CreateQaDto } from './dto/create-qa.dto';
+import { DuplicateCheckDto } from './dto/duplicate-check.dto';
 import { GenerateSimilarQuestionsDto } from './dto/generate-similar-questions.dto';
 import { SearchKnowledgeBaseDto } from './dto/search-knowledge-base.dto';
 import { UpdateQaDto } from './dto/update-qa.dto';
@@ -9,8 +10,12 @@ import { IndexBuilderService } from './services/index-builder.service';
 import { KnowledgeBaseStoreService } from './services/knowledge-base-store.service';
 import {
   CreateQaInput,
+  DuplicateCheckGroup,
+  DuplicateCheckItem,
+  DuplicateCheckResult,
   ImportQaJobSnapshot,
   ImportQaResult,
+  IndexType,
   KbQa,
   QaStatus,
   SearchCandidate,
@@ -24,8 +29,15 @@ interface ImportQaJob extends ImportQaJobSnapshot {
   cleanupTimer?: NodeJS.Timeout;
 }
 
+interface ImportRowWithNumber {
+  rowNumber: number;
+  dto: CreateQaDto;
+}
+
 @Injectable()
 export class KnowledgeBaseService implements OnModuleInit {
+  private readonly allowedAudiences = new Set(['common', 'runner', 'user']);
+
   private readonly indexAffectingFields: Array<keyof UpdateQaInput> = [
     'businessDomain',
     'audience',
@@ -88,6 +100,7 @@ export class KnowledgeBaseService implements OnModuleInit {
 
   async createQa(dto: CreateQaDto): Promise<KbQa> {
     const input = this.normalizeCreateInput(dto);
+    await this.assertNoDuplicateStandardQuestion(input);
     const builtIndexes = await this.indexBuilder.buildIndexes(input);
     return this.store.createQa(input, builtIndexes);
   }
@@ -97,15 +110,31 @@ export class KnowledgeBaseService implements OnModuleInit {
     rowNumbers?: number[],
     onProgress?: (progress: { processed: number; success: number; failed: number; total: number }) => void,
   ): Promise<ImportQaResult> {
+    const rowsWithNumbers = rows.map((dto, index) => ({
+      rowNumber: rowNumbers?.[index] || index + 1,
+      dto: this.sanitizeImportDto(dto),
+    }));
+    const validationErrors = await this.validateImportRows(rowsWithNumbers);
+
+    if (validationErrors.length > 0) {
+      return {
+        total: rows.length,
+        success: 0,
+        failed: validationErrors.length,
+        items: [],
+        errors: validationErrors,
+      };
+    }
+
     const items: KbQa[] = [];
     const errors: ImportQaResult['errors'] = [];
 
-    for (const [index, row] of rows.entries()) {
+    for (const [index, row] of rowsWithNumbers.entries()) {
       try {
-        items.push(await this.createQa(row));
+        items.push(await this.createQa(row.dto));
       } catch (caught) {
         errors.push({
-          row: rowNumbers?.[index] || index + 1,
+          row: row.rowNumber,
           message: caught instanceof Error ? caught.message : '导入失败',
         });
       }
@@ -263,16 +292,21 @@ export class KnowledgeBaseService implements OnModuleInit {
       return current;
     }
 
+    const merged: CreateQaInput = {
+      ...current,
+      ...patch,
+    };
+
+    if (this.shouldCheckDuplicateStandardQuestion(current, patch)) {
+      await this.assertNoDuplicateStandardQuestion(merged, id);
+    }
+
     const shouldRebuildIndex = this.shouldRebuildIndex(current, patch);
 
     if (!shouldRebuildIndex) {
       return this.store.updateQaOnly(id, patch);
     }
 
-    const merged: CreateQaInput = {
-      ...current,
-      ...patch,
-    };
     const builtIndexes = await this.indexBuilder.buildIndexes(merged);
 
     return this.store.updateQaWithIndexes(id, patch, builtIndexes);
@@ -379,6 +413,212 @@ export class KnowledgeBaseService implements OnModuleInit {
     };
   }
 
+  async checkDuplicates(dto: DuplicateCheckDto): Promise<DuplicateCheckResult> {
+    const audience = this.clean(dto.audience) || 'all';
+    const minScore = this.toNumber(dto.minScore, 0.86, 0);
+    const limit = Math.max(1, Math.min(this.toNumber(dto.limit, 50, 1), 100));
+    const qas = (await this.store.listQa()).filter((qa) =>
+      audience === 'all' ? true : qa.audience === audience,
+    );
+    const exactGroups = [
+      ...this.findStandardQuestionDuplicateGroups(qas),
+      ...this.findSimilarQuestionCrossDuplicateGroups(qas),
+    ];
+    const semanticGroups = await this.findSemanticDuplicateGroups(audience, minScore, limit);
+    const groups = [...exactGroups, ...semanticGroups].slice(0, limit);
+
+    return {
+      totalGroups: groups.length,
+      groups,
+      config: {
+        audience,
+        minScore,
+        limit,
+      },
+    };
+  }
+
+  private findStandardQuestionDuplicateGroups(qas: KbQa[]): DuplicateCheckGroup[] {
+    const groups = new Map<string, KbQa[]>();
+
+    for (const qa of qas) {
+      const key = this.buildQuestionDuplicateKey({
+        businessDomain: qa.businessDomain,
+        audience: qa.audience,
+        standardQuestion: qa.standardQuestion,
+      });
+      groups.set(key, [...(groups.get(key) || []), qa]);
+    }
+
+    return [...groups.values()]
+      .filter((items) => items.length > 1)
+      .map((items) => ({
+        id: `standard-${items.map((item) => item.id).sort((left, right) => left - right).join('-')}`,
+        type: 'standard_question',
+        reason: '标准问题完全重复',
+        matchedText: items[0].standardQuestion,
+        items: items.map((qa) => this.toDuplicateCheckItem(qa, qa.standardQuestion, 'standard_question')),
+      }));
+  }
+
+  private findSimilarQuestionCrossDuplicateGroups(qas: KbQa[]): DuplicateCheckGroup[] {
+    const entriesByText = new Map<
+      string,
+      Array<{ qa: KbQa; indexType: IndexType; text: string }>
+    >();
+
+    for (const qa of qas) {
+      const entries = [
+        { qa, indexType: 'standard_question' as IndexType, text: qa.standardQuestion },
+        ...this.indexBuilder.splitSimilarQuestions(qa.similarQuestions).map((text) => ({
+          qa,
+          indexType: 'manual_alias' as IndexType,
+          text,
+        })).filter((entry) => this.isMeaningfulSimilarQuestion(entry.text)),
+      ];
+
+      for (const entry of entries) {
+        const key = [
+          this.normalizeDuplicateText(qa.businessDomain),
+          this.normalizeDuplicateText(qa.audience),
+          this.normalizeDuplicateText(entry.text),
+        ].join('\u0001');
+        entriesByText.set(key, [...(entriesByText.get(key) || []), entry]);
+      }
+    }
+
+    const groups: DuplicateCheckGroup[] = [];
+
+    for (const entries of entriesByText.values()) {
+      const uniqueQaIds = new Set(entries.map((entry) => entry.qa.id));
+      const hasAlias = entries.some((entry) => entry.indexType === 'manual_alias');
+
+      if (uniqueQaIds.size < 2 || !hasAlias) {
+        continue;
+      }
+
+      const bestEntryByQa = new Map<number, { qa: KbQa; indexType: IndexType; text: string }>();
+
+      for (const entry of entries) {
+        const current = bestEntryByQa.get(entry.qa.id);
+
+        if (!current || entry.indexType === 'manual_alias') {
+          bestEntryByQa.set(entry.qa.id, entry);
+        }
+      }
+
+      const items = [...bestEntryByQa.values()]
+        .sort((left, right) => left.qa.id - right.qa.id);
+      const aliasCount = entries.filter((entry) => entry.indexType === 'manual_alias').length;
+      const reason = aliasCount === entries.length
+        ? '相似问法在多条 QA 中重复'
+        : '标准问题与其他 QA 的相似问法重复';
+
+      groups.push({
+        id: `alias-${items.map((item) => item.qa.id).join('-')}-${this.normalizeDuplicateText(items[0].text)}`,
+        type: 'similar_question_cross',
+        reason,
+        matchedText: items[0].text,
+        items: items.map((entry) =>
+          this.toDuplicateCheckItem(entry.qa, entry.text, entry.indexType),
+        ),
+      });
+    }
+
+    return groups;
+  }
+
+  private async findSemanticDuplicateGroups(
+    audience: string,
+    minScore: number,
+    limit: number,
+  ): Promise<DuplicateCheckGroup[]> {
+    const candidates = await this.store.findSemanticDuplicateCandidates({
+      audience,
+      minScore,
+      limit: limit * 4,
+    });
+    const bestByQaPair = new Map<string, (typeof candidates)[number]>();
+
+    for (const candidate of candidates) {
+      if (
+        !this.isMeaningfulDuplicateText(candidate.left.indexText) ||
+        !this.isMeaningfulDuplicateText(candidate.right.indexText)
+      ) {
+        continue;
+      }
+
+      if (
+        this.normalizeDuplicateText(candidate.left.indexText) ===
+        this.normalizeDuplicateText(candidate.right.indexText)
+      ) {
+        continue;
+      }
+
+      const pairKey = [candidate.left.qaId, candidate.right.qaId]
+        .sort((left, right) => left - right)
+        .join('-');
+      const current = bestByQaPair.get(pairKey);
+
+      if (!current || candidate.score > current.score) {
+        bestByQaPair.set(pairKey, candidate);
+      }
+    }
+
+    return [...bestByQaPair.values()]
+      .sort((left, right) => right.score - left.score)
+      .slice(0, limit)
+      .map((candidate) => ({
+        id: `semantic-${candidate.left.qaId}-${candidate.right.qaId}`,
+        type: 'semantic_similarity',
+        reason: '语义相似（使用现有向量索引，未调用模型）',
+        matchedText: `${candidate.left.indexText} ↔ ${candidate.right.indexText}`,
+        score: candidate.score,
+        items: [
+          {
+            qaId: candidate.left.qaId,
+            code: candidate.left.code,
+            standardQuestion: candidate.left.standardQuestion,
+            audience: candidate.left.audience,
+            categoryPath: candidate.left.categoryPath,
+            similarQuestions: candidate.left.similarQuestions,
+            answer: candidate.left.answer,
+            matchedText: candidate.left.indexText,
+            matchedIndexType: candidate.left.indexType,
+          },
+          {
+            qaId: candidate.right.qaId,
+            code: candidate.right.code,
+            standardQuestion: candidate.right.standardQuestion,
+            audience: candidate.right.audience,
+            categoryPath: candidate.right.categoryPath,
+            similarQuestions: candidate.right.similarQuestions,
+            answer: candidate.right.answer,
+            matchedText: candidate.right.indexText,
+            matchedIndexType: candidate.right.indexType,
+          },
+        ],
+      }));
+  }
+
+  private toDuplicateCheckItem(
+    qa: KbQa,
+    matchedText?: string,
+    matchedIndexType?: IndexType,
+  ): DuplicateCheckItem {
+    return {
+      qaId: qa.id,
+      code: qa.code,
+      standardQuestion: qa.standardQuestion,
+      audience: qa.audience,
+      categoryPath: qa.categoryPath,
+      similarQuestions: qa.similarQuestions,
+      answer: qa.answer,
+      matchedText,
+      matchedIndexType,
+    };
+  }
+
   private async runImportQaJob(
     jobId: string,
     rowsWithNumbers: Array<{ rowNumber: number; dto: CreateQaDto }>,
@@ -464,6 +704,165 @@ export class KnowledgeBaseService implements OnModuleInit {
       updatedAt: job.updatedAt,
       completedAt: job.completedAt,
     };
+  }
+
+  private async assertNoDuplicateStandardQuestion(
+    input: {
+      businessDomain?: string;
+      audience?: string;
+      standardQuestion: string;
+    },
+    excludeId?: number,
+  ): Promise<void> {
+    const duplicate = await this.store.findDuplicateStandardQuestion({
+      businessDomain: input.businessDomain,
+      audience: input.audience,
+      standardQuestion: input.standardQuestion,
+      excludeId,
+    });
+
+    if (duplicate) {
+      throw new BadRequestException(
+        `标准问题与已有 QA ${duplicate.code} 重复：${duplicate.standardQuestion}`,
+      );
+    }
+  }
+
+  private shouldCheckDuplicateStandardQuestion(current: KbQa, patch: UpdateQaInput): boolean {
+    return (
+      (patch.businessDomain !== undefined && patch.businessDomain !== current.businessDomain) ||
+      (patch.audience !== undefined && patch.audience !== current.audience) ||
+      (patch.standardQuestion !== undefined && patch.standardQuestion !== current.standardQuestion)
+    );
+  }
+
+  private async validateImportRows(rows: ImportRowWithNumber[]): Promise<ImportQaResult['errors']> {
+    const rowMessages = new Map<number, string[]>();
+    const existingQas = await this.store.listQa();
+    const existingQuestionKeys = new Map<string, string>();
+    const batchQuestionKeys = new Map<string, number>();
+
+    for (const qa of existingQas) {
+      existingQuestionKeys.set(
+        this.buildQuestionDuplicateKey({
+          businessDomain: qa.businessDomain,
+          audience: qa.audience,
+          standardQuestion: qa.standardQuestion,
+        }),
+        qa.code,
+      );
+    }
+
+    for (const row of rows) {
+      const standardQuestion = this.clean(row.dto.standardQuestion);
+      const answer = this.clean(row.dto.answer);
+      const businessDomain = this.clean(row.dto.businessDomain) || '';
+      const audience = this.clean(row.dto.audience) || 'runner';
+      const categoryPath = this.clean(row.dto.categoryPath);
+
+      if (!standardQuestion) {
+        this.addImportError(rowMessages, row.rowNumber, '标准问题不能为空');
+      }
+
+      if (!answer) {
+        this.addImportError(rowMessages, row.rowNumber, '标准答案不能为空');
+      }
+
+      if (!this.allowedAudiences.has(audience)) {
+        this.addImportError(rowMessages, row.rowNumber, '身份/适用对象仅支持：通用、跑男、用户');
+      }
+
+      if (businessDomain.length > 64) {
+        this.addImportError(rowMessages, row.rowNumber, '业务域长度不能超过 64 个字符');
+      }
+
+      if (categoryPath && categoryPath.length > 255) {
+        this.addImportError(rowMessages, row.rowNumber, '分类路径长度不能超过 255 个字符');
+      }
+
+      if (categoryPath && categoryPath.split('/').some((part) => !this.clean(part))) {
+        this.addImportError(rowMessages, row.rowNumber, '分类路径格式不正确，请使用 一级/二级/三级');
+      }
+
+      if (!standardQuestion || !this.allowedAudiences.has(audience)) {
+        continue;
+      }
+
+      const duplicateKey = this.buildQuestionDuplicateKey({
+        businessDomain,
+        audience,
+        standardQuestion,
+      });
+      const existingCode = existingQuestionKeys.get(duplicateKey);
+      const firstRow = batchQuestionKeys.get(duplicateKey);
+
+      if (existingCode) {
+        this.addImportError(
+          rowMessages,
+          row.rowNumber,
+          `与知识库已有 QA ${existingCode} 的标准问题重复`,
+        );
+      }
+
+      if (firstRow) {
+        this.addImportError(rowMessages, row.rowNumber, `与第 ${firstRow} 行标准问题重复`);
+      } else {
+        batchQuestionKeys.set(duplicateKey, row.rowNumber);
+      }
+    }
+
+    return [...rowMessages.entries()]
+      .sort(([leftRow], [rightRow]) => leftRow - rightRow)
+      .map(([row, messages]) => ({
+        row,
+        message: [...new Set(messages)].join('；'),
+      }));
+  }
+
+  private addImportError(
+    rowMessages: Map<number, string[]>,
+    rowNumber: number,
+    message: string,
+  ) {
+    rowMessages.set(rowNumber, [...(rowMessages.get(rowNumber) || []), message]);
+  }
+
+  private sanitizeImportDto(dto: CreateQaDto): CreateQaDto {
+    return {
+      ...dto,
+      audience: this.normalizeAudience(this.clean(dto.audience)) || this.clean(dto.audience),
+      categoryPath: this.normalizeCategoryPath(dto.categoryPath),
+      similarQuestions: this.normalizeSimilarQuestions(dto.similarQuestions),
+    };
+  }
+
+  private normalizeCategoryPath(value?: string): string | undefined {
+    const cleaned = this.clean(value);
+
+    if (!cleaned) {
+      return undefined;
+    }
+
+    return cleaned
+      .split('/')
+      .map((part) => this.clean(part) || '')
+      .join('/');
+  }
+
+  private buildQuestionDuplicateKey(input: {
+    businessDomain?: string;
+    audience?: string;
+    standardQuestion?: string;
+  }): string {
+    return [
+      this.normalizeDuplicateText(input.businessDomain),
+      this.normalizeDuplicateText(input.audience || 'runner'),
+      this.normalizeDuplicateText(input.standardQuestion),
+    ].join('\u0001');
+  }
+
+  private normalizeDuplicateText(value?: string): string {
+    return (value || '').trim().replace(/\s+/g, ' ').toLowerCase();
   }
 
   private shouldRebuildIndex(current: KbQa, patch: UpdateQaInput): boolean {
@@ -765,9 +1164,27 @@ export class KnowledgeBaseService implements OnModuleInit {
       .replace(/([?？])\s*/g, '$1\n')
       .split(/[;；\n\r]+/)
       .map((item) => item.trim().replace(/\s+/g, ' '))
-      .filter(Boolean);
+      .filter((item) => this.isMeaningfulDuplicateText(item));
 
     return [...new Set(items)].join(';') || undefined;
+  }
+
+  private isMeaningfulSimilarQuestion(value?: string): boolean {
+    return this.isMeaningfulDuplicateText(value);
+  }
+
+  private isMeaningfulDuplicateText(value?: string): boolean {
+    const normalized = (value || '').trim().replace(/\s+/g, '');
+
+    if (!normalized) {
+      return false;
+    }
+
+    if (/^[\p{P}\p{S}]+$/u.test(normalized)) {
+      return false;
+    }
+
+    return !['/', '-', '--', '—', '无', '暂无', '无相似问法', '没有'].includes(normalized);
   }
 
   private normalizeAudience(value?: string): string | undefined {

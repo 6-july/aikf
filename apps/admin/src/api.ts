@@ -1,4 +1,5 @@
 import {
+  DuplicateCheckResult,
   ImportQaJobSnapshot,
   KbQa,
   QaForm,
@@ -178,6 +179,17 @@ export function testSearch(payload: {
   finalTopK: number;
 }) {
   return request<SearchResult>('/knowledge-base/test-search', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export function checkDuplicates(payload: {
+  audience: string;
+  minScore: number;
+  limit: number;
+}) {
+  return request<DuplicateCheckResult>('/knowledge-base/duplicate-check', {
     method: 'POST',
     body: JSON.stringify(payload),
   });

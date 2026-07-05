@@ -24,7 +24,7 @@ import {
   PanelLeftOpen,
   MessageSquareText,
   Plus,
-  RefreshCw,
+  RotateCcw,
   Search,
   Settings,
   Sparkles,
@@ -44,6 +44,7 @@ import {
   useState,
 } from 'react';
 import {
+  checkDuplicates,
   createQa,
   deleteQa,
   generateSimilarQuestions,
@@ -54,7 +55,17 @@ import {
   testSearch,
   updateQa,
 } from './api';
-import { ImportQaJobSnapshot, ImportQaJobStatus, KbQa, QaForm, SearchResult } from './types';
+import {
+  DuplicateCheckResult,
+  DuplicateCheckType,
+  DuplicateCheckGroup,
+  DuplicateCheckItem,
+  ImportQaJobSnapshot,
+  ImportQaJobStatus,
+  KbQa,
+  QaForm,
+  SearchResult,
+} from './types';
 
 const emptyForm: QaForm = {
   businessDomain: '',
@@ -74,12 +85,12 @@ const menuItems = [
   { label: '系统设置', icon: Settings },
 ];
 
-type DrawerType = 'test' | null;
+type DrawerType = 'test' | 'duplicate' | null;
 type EditingId = number | 'new' | null;
 type ConfirmAction =
-  | { type: 'save-form' }
   | { type: 'status'; qa: KbQa; action: 'delete' }
-  | { type: 'batch'; qas: KbQa[]; action: 'delete' };
+  | { type: 'batch'; qas: KbQa[]; action: 'delete' }
+  | { type: 'duplicate-delete'; item: DuplicateCheckItem; groupId: string; action: 'delete' };
 type SortMode = 'default' | 'hit_asc' | 'hit_desc' | 'created_asc' | 'created_desc';
 type SelectOption = {
   value: string;
@@ -114,6 +125,16 @@ const sortOptions: SelectOption[] = [
 const QA_LIST_PAGE_SIZE = 50;
 const QA_LIST_MAX_VISIBLE = 500;
 const maxRecallOptions = [1, 3, 5, 10, 20];
+const duplicateThresholdOptions = [0.8, 0.86, 0.9, 0.95];
+const duplicateAudienceOptions: SelectOption[] = [
+  { value: 'all', label: '全部对象' },
+  ...audienceOptions,
+];
+const duplicateTypeOrder: DuplicateCheckType[] = [
+  'standard_question',
+  'similar_question_cross',
+  'semantic_similarity',
+];
 
 function toForm(qa: KbQa): QaForm {
   return {
@@ -152,6 +173,10 @@ export function App() {
   const [finalTopK, setFinalTopK] = useState(5);
   const [searchResult, setSearchResult] = useState<SearchResult | null>(null);
   const [searching, setSearching] = useState(false);
+  const [duplicateAudience, setDuplicateAudience] = useState('all');
+  const [duplicateMinScore, setDuplicateMinScore] = useState(0.86);
+  const [duplicateResult, setDuplicateResult] = useState<DuplicateCheckResult | null>(null);
+  const [checkingDuplicates, setCheckingDuplicates] = useState(false);
   const [visibleQaCount, setVisibleQaCount] = useState(QA_LIST_PAGE_SIZE);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [selectedQaIds, setSelectedQaIds] = useState<number[]>([]);
@@ -288,6 +313,30 @@ export function App() {
     } finally {
       setLoading(false);
     }
+  }
+
+  function resetPageState() {
+    setFilter('');
+    setAudienceFilter('all');
+    setSortMode('default');
+    setVisibleQaCount(QA_LIST_PAGE_SIZE);
+    setSelectedQaIds([]);
+    setSelectedId(null);
+    setEditingId(null);
+    setForm(emptyForm);
+    setSimilarCandidates([]);
+    setSearchResult(null);
+    setDuplicateResult(null);
+    setDuplicateAudience('all');
+    setDuplicateMinScore(0.86);
+    setError('');
+    setNotice('');
+    setConfirmAction(null);
+    setDrawer(null);
+    void loadQas(null);
+    window.requestAnimationFrame(() => {
+      qaListRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+    });
   }
 
   function startCreate() {
@@ -475,19 +524,29 @@ export function App() {
     setNotice(`已导出 ${selectedQas.length} 条 QA`);
   }
 
-  function requestSaveConfirm() {
+  function publishForm() {
     if (!form.standardQuestion.trim() || !form.answer.trim()) {
       setError('标准问题和答案不能为空');
       return;
     }
 
     setError('');
-    setConfirmAction({ type: 'save-form' });
+    void saveQa();
   }
 
   function requestDeleteConfirm(qa: KbQa) {
     setError('');
     setConfirmAction({ type: 'status', qa, action: 'delete' });
+  }
+
+  function requestDuplicateDeleteConfirm(group: DuplicateCheckGroup, item: DuplicateCheckItem) {
+    setError('');
+    setConfirmAction({
+      type: 'duplicate-delete',
+      item,
+      groupId: group.id,
+      action: 'delete',
+    });
   }
 
   async function saveQa(): Promise<boolean> {
@@ -504,10 +563,10 @@ export function App() {
       setEditingId(null);
       setSelectedId(saved.id);
       setSimilarCandidates([]);
-      setNotice(existingId ? '已保存修改' : '已新增 QA');
+      setNotice(existingId ? '已发布修改' : '已新增并发布 QA');
       return true;
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : '保存失败');
+      setError(caught instanceof Error ? caught.message : '发布失败');
       return false;
     } finally {
       setSaving(false);
@@ -533,6 +592,56 @@ export function App() {
     }
   }
 
+  async function deleteDuplicateQa(
+    item: DuplicateCheckItem,
+    groupId: string,
+  ): Promise<boolean> {
+    setError('');
+    setNotice('');
+
+    try {
+      await deleteQa(item.qaId);
+      setQas((current) => current.filter((qa) => qa.id !== item.qaId));
+      setSelectedQaIds((current) => current.filter((id) => id !== item.qaId));
+      setDuplicateResult((current) => {
+        if (!current) {
+          return current;
+        }
+
+        const groups = current.groups
+          .map((group) => {
+            if (group.id !== groupId) {
+              return group;
+            }
+
+            return {
+              ...group,
+              items: group.items.filter((groupItem) => groupItem.qaId !== item.qaId),
+            };
+          })
+          .filter((group) => group.type !== 'standard_question' || group.items.length > 1);
+
+        return {
+          ...current,
+          totalGroups: groups.length,
+          groups,
+        };
+      });
+
+      if (editingId === item.qaId) {
+        setEditingId(null);
+        setSelectedId(null);
+        setForm(emptyForm);
+      }
+
+      setNotice(`已删除 ${item.code}`);
+      return true;
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : '操作失败');
+      return false;
+    }
+  }
+
   async function confirmCurrentAction() {
     if (!confirmAction) {
       return;
@@ -542,11 +651,11 @@ export function App() {
 
     try {
       const success =
-        confirmAction.type === 'save-form'
-          ? await saveQa()
-          : confirmAction.type === 'batch'
-            ? await deleteBatchQas(confirmAction.qas)
-            : await deleteSingleQa(confirmAction.qa);
+        confirmAction.type === 'batch'
+          ? await deleteBatchQas(confirmAction.qas)
+          : confirmAction.type === 'duplicate-delete'
+            ? await deleteDuplicateQa(confirmAction.item, confirmAction.groupId)
+          : await deleteSingleQa(confirmAction.qa);
 
       if (success) {
         setConfirmAction(null);
@@ -723,6 +832,25 @@ export function App() {
     }
   }
 
+  async function runDuplicateCheck() {
+    setCheckingDuplicates(true);
+    setDuplicateResult(null);
+    setError('');
+
+    try {
+      const result = await checkDuplicates({
+        audience: duplicateAudience,
+        minScore: duplicateMinScore,
+        limit: 50,
+      });
+      setDuplicateResult(result);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : '重复检测失败');
+    } finally {
+      setCheckingDuplicates(false);
+    }
+  }
+
   function renderQaRow(qa: KbQa) {
     const isEditing = editingId === qa.id;
     const similarQuestions = parseSimilarQuestions(qa.similarQuestions);
@@ -774,11 +902,11 @@ export function App() {
                   highContrast
                   size="1"
                   disabled={saving}
-                  onClick={requestSaveConfirm}
+                  onClick={publishForm}
                   type="button"
                 >
                   <Check size={15} />
-                  {saving ? '保存中' : '保存'}
+                  {saving ? '发布中' : '发布'}
                 </Button>
                 <Button color="gray" highContrast size="1" variant="outline" onClick={cancelEdit} type="button">
                   <X size={15} />
@@ -827,18 +955,18 @@ export function App() {
           <div className="inline-editor-bar">
             <div>
               <h3>新增 QA</h3>
-              <p>保存后立即生成索引并生效</p>
+              <p>填写完成后可直接发布</p>
             </div>
             <div className="row-actions">
               <Button
                 highContrast
                 size="1"
                 disabled={saving}
-                onClick={requestSaveConfirm}
+                onClick={publishForm}
                 type="button"
               >
                 <Check size={15} />
-                {saving ? '保存中' : '保存'}
+                {saving ? '发布中' : '发布'}
               </Button>
               <Button color="gray" highContrast size="1" variant="outline" onClick={cancelEdit} type="button">
                 <X size={15} />
@@ -849,6 +977,10 @@ export function App() {
         )}
 
         <div className="inline-edit-fields">
+          <div className="publish-warning">
+            <AlertTriangle size={14} />
+            <span>发布后会立即生成或更新索引，并参与知识库召回，请确认内容无误。</span>
+          </div>
           <div className="inline-form-grid">
             <Field label="标准问题">
               <TextField.Root
@@ -875,42 +1007,47 @@ export function App() {
           </div>
 
           <Field label="相似问法">
-            <TextArea
-              value={form.similarQuestions}
-              onChange={(event) => updateField('similarQuestions', event.target.value)}
-              placeholder="如何加入跑男;怎么跑单，也支持换行粘贴"
-              rows={2}
-            />
+            <div className="similar-question-control">
+              <TextArea
+                value={form.similarQuestions}
+                onChange={(event) => updateField('similarQuestions', event.target.value)}
+                placeholder="如何加入跑男;怎么跑单，也支持换行粘贴"
+                rows={2}
+              />
+              <div className="similar-question-tools">
+                <Button
+                  color="gray"
+                  size="1"
+                  variant="ghost"
+                  disabled={!selectedQa}
+                  onClick={() => void runGenerateSimilar()}
+                  type="button"
+                  title="生成相似问法"
+                >
+                  <Sparkles size={15} />
+                  生成相似问法
+                </Button>
+              </div>
+              {similarCandidates.length > 0 && (
+                <div className="similar-candidate-actions">
+                  {similarCandidates.map((candidate) => (
+                    <Button
+                      color="gray"
+                      size="1"
+                      variant="soft"
+                      key={candidate}
+                      onClick={() => appendSimilarQuestion(candidate)}
+                      type="button"
+                      title="追加到相似问法"
+                    >
+                      <Plus size={14} />
+                      {candidate}
+                    </Button>
+                  ))}
+                </div>
+              )}
+            </div>
           </Field>
-
-          <div className="inline-actions">
-            <Button
-              color="gray"
-              highContrast
-              variant="outline"
-              disabled={!selectedQa}
-              onClick={() => void runGenerateSimilar()}
-              type="button"
-              title="生成相似问法"
-            >
-              <Sparkles size={17} />
-              生成相似问法
-            </Button>
-            {similarCandidates.map((candidate) => (
-              <Button
-                color="gray"
-                size="1"
-                variant="soft"
-                key={candidate}
-                onClick={() => appendSimilarQuestion(candidate)}
-                type="button"
-                title="追加到相似问法"
-              >
-                <Plus size={14} />
-                {candidate}
-              </Button>
-            ))}
-          </div>
 
           <Field label="标准答案">
             <TextArea
@@ -932,15 +1069,66 @@ export function App() {
     );
   }
 
+  function renderDuplicateGroup(group: DuplicateCheckGroup) {
+    return (
+      <div className="result-box duplicate-box" key={group.id}>
+        {group.score !== undefined && (
+          <div className="result-score duplicate-score">
+            <span>相似度</span>
+            <strong>{group.score.toFixed(4)}</strong>
+          </div>
+        )}
+        <div className="duplicate-items">
+          {group.items.map((item) => (
+            <div className="duplicate-item" key={`${group.id}-${item.qaId}`}>
+              <div className="duplicate-item-title">
+                <div>
+                  <strong>{item.code}</strong>
+                  <span>{highlightDuplicateText(item.standardQuestion, duplicateHighlightText(group, item, 'standardQuestion'))}</span>
+                </div>
+                {group.type === 'standard_question' && (
+                  <Button
+                    className="duplicate-delete-button"
+                    color="red"
+                    size="1"
+                    variant="ghost"
+                    onClick={() => requestDuplicateDeleteConfirm(group, item)}
+                    type="button"
+                    title="删除这条 QA"
+                  >
+                    <Trash2 size={14} />
+                    删除
+                  </Button>
+                )}
+              </div>
+              <div className="duplicate-item-row">
+                <span className="duplicate-item-label">分类</span>
+                <span>{item.categoryPath || '未分类'} · {audienceLabel(item.audience)}</span>
+              </div>
+              <div className="duplicate-item-row">
+                <span className="duplicate-item-label">相似问法</span>
+                <span>{highlightDuplicateText(item.similarQuestions || '无', duplicateHighlightText(group, item, 'similarQuestions'))}</span>
+              </div>
+              <div className="duplicate-item-row">
+                <span className="duplicate-item-label">答案</span>
+                <span>{item.answer}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
   function confirmTitle() {
     if (!confirmAction) return '';
 
-    if (confirmAction.type === 'save-form') {
-      return '确认保存这条 QA？';
+    if (confirmAction.type === 'batch') {
+      return `确认删除选中的 ${confirmAction.qas.length} 条 QA？`;
     }
 
-    if (confirmAction.type === 'batch') {
-      return `确认批量删除 ${confirmAction.qas.length} 条 QA？`;
+    if (confirmAction.type === 'duplicate-delete') {
+      return '确认删除这条重复 QA？';
     }
 
     return '确认删除这条 QA？';
@@ -949,13 +1137,12 @@ export function App() {
   function confirmDescription() {
     if (!confirmAction) return '';
 
-    if (confirmAction.type === 'save-form') {
-      const target = form.standardQuestion.trim() || '当前 QA';
-      return `「${target}」保存后会立即生成或更新索引，并生效。`;
+    if (confirmAction.type === 'batch') {
+      return '批量删除后，这些 QA 将不再出现在知识库列表中，也不再参与知识库召回。';
     }
 
-    if (confirmAction.type === 'batch') {
-      return '选中的 QA 删除后不再出现在知识库列表中，也不再参与知识库召回。';
+    if (confirmAction.type === 'duplicate-delete') {
+      return `「${confirmAction.item.code} · ${confirmAction.item.standardQuestion}」删除后将从当前检测结果中移除，也不再参与知识库召回。`;
     }
 
     const target = `「${confirmAction.qa.standardQuestion}」`;
@@ -965,12 +1152,8 @@ export function App() {
   function confirmButtonText() {
     if (!confirmAction) return '';
 
-    if (confirmAction.type === 'save-form') {
-      return '确认保存';
-    }
-
     if (confirmAction.type === 'batch') {
-      return '确认删除';
+      return `删除 ${confirmAction.qas.length} 条`;
     }
 
     return '确认删除';
@@ -978,7 +1161,9 @@ export function App() {
 
   function isDangerConfirm() {
     return (
-      (confirmAction?.type === 'status' || confirmAction?.type === 'batch') &&
+      (confirmAction?.type === 'status' ||
+        confirmAction?.type === 'batch' ||
+        confirmAction?.type === 'duplicate-delete') &&
       confirmAction.action === 'delete'
     );
   }
@@ -1034,8 +1219,14 @@ export function App() {
             <h1>知识库</h1>
           </div>
           <div className="toolbar">
-            <Button highContrast onClick={() => void loadQas()} type="button" variant="ghost" title="刷新 QA">
-              <RefreshCw size={17} />
+            <Button
+              highContrast
+              onClick={resetPageState}
+              type="button"
+              variant="ghost"
+              title="刷新页面状态并重新加载数据"
+            >
+              <RotateCcw size={17} />
               刷新
             </Button>
             <Button highContrast onClick={downloadTemplate} type="button" variant="ghost" title="下载 Excel 模板">
@@ -1060,6 +1251,17 @@ export function App() {
               ref={fileInputRef}
               type="file"
             />
+            <Button
+              color="gray"
+              highContrast
+              onClick={() => setDrawer('duplicate')}
+              type="button"
+              variant="outline"
+              title="检测知识库重复 QA"
+            >
+              <Search size={17} />
+              重复检测
+            </Button>
             <Button
               color="gray"
               highContrast
@@ -1199,7 +1401,7 @@ export function App() {
                   </Button>
                   <Button color="red" size="1" variant="outline" onClick={requestBatchDeleteConfirm} type="button">
                     <Trash2 size={15} />
-                    删除
+                    批量删除
                   </Button>
                   <Button color="gray" highContrast size="1" variant="outline" onClick={clearSelectedQas} type="button">
                     <X size={15} />
@@ -1267,11 +1469,15 @@ export function App() {
         {drawer && (
           <div className="drawer-layer" role="presentation">
             <button className="drawer-backdrop" onClick={() => setDrawer(null)} type="button" />
-            <aside className="drawer" aria-label="召回测试">
+            <aside className="drawer" aria-label={drawer === 'test' ? '召回测试' : '重复检测'}>
               <div className="drawer-head">
                 <div>
-                  <h2>召回测试</h2>
-                  <p>实时调用 test-search</p>
+                  <h2>{drawer === 'test' ? '召回测试' : '重复检测'}</h2>
+                  <p>
+                    {drawer === 'test'
+                      ? '实时调用 test-search'
+                      : '检测标准问题、相似问法和现有向量索引'}
+                  </p>
                 </div>
                 <TooltipLabel content="关闭">
                   <IconButton aria-label="关闭" color="gray" onClick={() => setDrawer(null)} type="button" variant="outline">
@@ -1281,6 +1487,8 @@ export function App() {
               </div>
 
               <div className="drawer-body">
+                {drawer === 'test' ? (
+                  <>
                 <Field className="test-query-field" label="测试问题">
                   <TextArea
                     value={testQuery}
@@ -1348,11 +1556,16 @@ export function App() {
                     {searching ? '测试中' : '开始测试'}
                   </Button>
                 </div>
+                <p className="result-note">
+                  （注：召回测试仅代表知识库匹配情况，最终回复会由 AI 结合上下文再次判断是否采纳。）
+                </p>
 
                 {searchResult && (
                   <div className="result-list">
                     <div className="result-summary">
-                      <span>召回结果</span>
+                      <div className="result-summary-title">
+                        <span className="result-summary-label">召回结果</span>
+                      </div>
                       <strong>
                         {searchResult.matches.length}/{finalTopK}
                       </strong>
@@ -1366,15 +1579,93 @@ export function App() {
                           </div>
                           <h3>{match.standardQuestion}</h3>
                           <p>{match.answer}</p>
-                          <small>
-                            {indexTypeLabel(match.indexType)} · {match.matchedIndexText}
-                          </small>
+                          <div className="result-hit-source">
+                            <span>命中来源：{indexTypeLabel(match.indexType)}</span>
+                            <span>命中文本：{match.matchedIndexText}</span>
+                          </div>
                         </div>
                       ))
                     ) : (
                       <div className="result-empty">没有达到最低匹配度的召回结果</div>
                     )}
                   </div>
+                )}
+                  </>
+                ) : (
+                  <>
+                    <div className="duplicate-intro">
+                      本次检测包含标准问题重复、相似问法交叉重复、语义相似。语义相似仅使用已有向量索引，不调用模型。
+                    </div>
+                    <div className="test-grid">
+                      <Field label="检测对象">
+                        <SelectField
+                          ariaLabel="检测对象"
+                          options={duplicateAudienceOptions}
+                          value={duplicateAudience}
+                          onValueChange={setDuplicateAudience}
+                        />
+                      </Field>
+                      <Field label="语义阈值">
+                        <SelectField
+                          ariaLabel="语义阈值"
+                          options={duplicateThresholdOptions.map((option) => ({
+                            value: String(option),
+                            label: option.toFixed(2),
+                          }))}
+                          value={String(duplicateMinScore)}
+                          onValueChange={(value) => setDuplicateMinScore(Number(value))}
+                        />
+                      </Field>
+                    </div>
+                    <div className="drawer-actions">
+                      <Button
+                        className="full"
+                        highContrast
+                        disabled={checkingDuplicates}
+                        onClick={() => void runDuplicateCheck()}
+                        type="button"
+                      >
+                        <Search size={17} />
+                        {checkingDuplicates ? '检测中' : '开始检测'}
+                      </Button>
+                    </div>
+
+                    {duplicateResult && (
+                      <div className="result-list">
+                        <div className="result-summary">
+                          <div className="result-summary-title">
+                            <span className="result-summary-label">检测结果</span>
+                          </div>
+                          <strong>{duplicateResult.groups.length} 组</strong>
+                        </div>
+                        {duplicateResult.groups.length > 0 ? (
+                          <div className="duplicate-sections">
+                            {duplicateTypeOrder.map((type) => {
+                              const groups = duplicateResult.groups.filter((group) => group.type === type);
+
+                              return (
+                                <details className="duplicate-section" key={type} open={groups.length > 0}>
+                                  <summary>
+                                    <span>{duplicateTypeLabel(type)}</span>
+                                    <strong>{groups.length} 组</strong>
+                                  </summary>
+                                  {groups.length > 0 ? (
+                                    <div className="duplicate-section-body">
+                                      {groups.map((group) => renderDuplicateGroup(group))}
+                                    </div>
+                                  ) : (
+                                    <div className="result-empty compact">暂无结果</div>
+                                  )}
+                                </details>
+                              );
+                            })}
+                          </div>
+                        ) : (
+                          <div className="result-empty">未发现疑似重复 QA</div>
+                        )}
+                      </div>
+                    )}
+                  </>
                 )}
 
               </div>
@@ -1442,6 +1733,68 @@ function indexTypeLabel(value?: string) {
   return labels[value || ''] || value || '未知索引';
 }
 
+function duplicateTypeLabel(value: DuplicateCheckType) {
+  const labels: Record<DuplicateCheckType, string> = {
+    standard_question: '标准问题重复',
+    similar_question_cross: '相似问法交叉重复',
+    semantic_similarity: '语义相似',
+  };
+
+  return labels[value];
+}
+
+function duplicateHighlightText(
+  group: DuplicateCheckGroup,
+  item: DuplicateCheckItem,
+  field: 'standardQuestion' | 'similarQuestions',
+) {
+  if (group.type === 'standard_question') {
+    return field === 'standardQuestion' ? group.matchedText : undefined;
+  }
+
+  if (group.type === 'similar_question_cross') {
+    return field === 'similarQuestions' ? group.matchedText : undefined;
+  }
+
+  if (item.matchedIndexType === 'standard_question') {
+    return field === 'standardQuestion' ? item.matchedText : undefined;
+  }
+
+  if (item.matchedIndexType === 'manual_alias') {
+    return field === 'similarQuestions' ? item.matchedText : undefined;
+  }
+
+  return undefined;
+}
+
+function highlightDuplicateText(text: string, highlight?: string): ReactNode {
+  if (!highlight) {
+    return text;
+  }
+
+  const normalizedHighlight = highlight.trim();
+
+  if (!normalizedHighlight) {
+    return text;
+  }
+
+  const index = text.toLowerCase().indexOf(normalizedHighlight.toLowerCase());
+
+  if (index < 0) {
+    return text;
+  }
+
+  return (
+    <>
+      {text.slice(0, index)}
+      <mark className="duplicate-highlight">
+        {text.slice(index, index + normalizedHighlight.length)}
+      </mark>
+      {text.slice(index + normalizedHighlight.length)}
+    </>
+  );
+}
+
 function SignalPopover({
   label,
   title,
@@ -1500,10 +1853,10 @@ function Field({
   className?: string;
 }) {
   return (
-    <label className={`field ${className}`}>
+    <div className={`field ${className}`}>
       <span>{label}</span>
       {children}
-    </label>
+    </div>
   );
 }
 

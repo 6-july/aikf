@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { PoolClient, QueryResultRow } from 'pg';
 import { DatabaseService } from '../../../database/database.service';
 import {
@@ -49,6 +49,54 @@ interface SearchIndexRow extends QueryResultRow {
   index_type: KbQaIndex['indexType'];
   index_text: string;
   score: string;
+}
+
+interface SemanticDuplicateRow extends QueryResultRow {
+  left_qa_id: string;
+  left_code: string;
+  left_standard_question: string;
+  left_similar_questions?: string;
+  left_answer: string;
+  left_audience: string;
+  left_category_path?: string;
+  left_index_type: KbQaIndex['indexType'];
+  left_index_text: string;
+  right_qa_id: string;
+  right_code: string;
+  right_standard_question: string;
+  right_similar_questions?: string;
+  right_answer: string;
+  right_audience: string;
+  right_category_path?: string;
+  right_index_type: KbQaIndex['indexType'];
+  right_index_text: string;
+  score: string;
+}
+
+export interface SemanticDuplicateCandidate {
+  left: {
+    qaId: number;
+    code: string;
+    standardQuestion: string;
+    similarQuestions: string;
+    answer: string;
+    audience: string;
+    categoryPath?: string;
+    indexType: KbQaIndex['indexType'];
+    indexText: string;
+  };
+  right: {
+    qaId: number;
+    code: string;
+    standardQuestion: string;
+    similarQuestions: string;
+    answer: string;
+    audience: string;
+    categoryPath?: string;
+    indexType: KbQaIndex['indexType'];
+    indexText: string;
+  };
+  score: number;
 }
 
 @Injectable()
@@ -104,6 +152,37 @@ export class KnowledgeBaseStoreService {
     return this.mapQa(row);
   }
 
+  async findDuplicateStandardQuestion(options: {
+    businessDomain?: string;
+    audience?: string;
+    standardQuestion: string;
+    excludeId?: number;
+  }): Promise<KbQa | undefined> {
+    const result = await this.database.query<QaRow>(
+      `
+      SELECT *
+      FROM kb_qa
+      WHERE status <> 'deleted'
+        AND business_domain = $1
+        AND audience = $2
+        AND lower(regexp_replace(btrim(standard_question), '[[:space:]]+', ' ', 'g')) =
+            lower(regexp_replace(btrim($3::text), '[[:space:]]+', ' ', 'g'))
+        AND ($4::bigint IS NULL OR id <> $4::bigint)
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [
+        this.clean(options.businessDomain) || '',
+        this.clean(options.audience) || 'runner',
+        this.cleanRequired(options.standardQuestion, 'standardQuestion'),
+        options.excludeId ?? null,
+      ],
+    );
+
+    const row = result.rows[0];
+    return row ? this.mapQa(row) : undefined;
+  }
+
   async searchIndexes(options: {
     businessDomain: string;
     audiences: string[];
@@ -140,6 +219,84 @@ export class KnowledgeBaseStoreService {
       qaId: Number(row.qa_id),
       indexType: row.index_type,
       indexText: row.index_text,
+      score: Number(Number(row.score).toFixed(6)),
+    }));
+  }
+
+  async findSemanticDuplicateCandidates(options: {
+    audience?: string;
+    minScore: number;
+    limit: number;
+  }): Promise<SemanticDuplicateCandidate[]> {
+    const result = await this.database.query<SemanticDuplicateRow>(
+      `
+      SELECT
+        left_index.qa_id AS left_qa_id,
+        left_qa.code AS left_code,
+        left_qa.standard_question AS left_standard_question,
+        left_qa.similar_questions AS left_similar_questions,
+        left_qa.answer AS left_answer,
+        left_qa.audience AS left_audience,
+        left_qa.category_path AS left_category_path,
+        left_index.index_type AS left_index_type,
+        left_index.index_text AS left_index_text,
+        right_index.qa_id AS right_qa_id,
+        right_qa.code AS right_code,
+        right_qa.standard_question AS right_standard_question,
+        right_qa.similar_questions AS right_similar_questions,
+        right_qa.answer AS right_answer,
+        right_qa.audience AS right_audience,
+        right_qa.category_path AS right_category_path,
+        right_index.index_type AS right_index_type,
+        right_index.index_text AS right_index_text,
+        1 - (left_index.embedding <=> right_index.embedding) AS score
+      FROM kb_qa_index left_index
+      JOIN kb_qa left_qa ON left_qa.id = left_index.qa_id
+      JOIN kb_qa_index right_index ON right_index.qa_id > left_index.qa_id
+      JOIN kb_qa right_qa ON right_qa.id = right_index.qa_id
+      WHERE left_index.status = 'active'
+        AND right_index.status = 'active'
+        AND left_qa.status <> 'deleted'
+        AND right_qa.status <> 'deleted'
+        AND left_qa.business_domain = right_qa.business_domain
+        AND left_qa.audience = right_qa.audience
+        AND ($1 = 'all' OR left_qa.audience = $1)
+        AND left_index.index_type IN ('standard_question', 'manual_alias')
+        AND right_index.index_type IN ('standard_question', 'manual_alias')
+        AND 1 - (left_index.embedding <=> right_index.embedding) >= $2
+      ORDER BY score DESC
+      LIMIT $3
+      `,
+      [
+        this.clean(options.audience) || 'all',
+        options.minScore,
+        options.limit,
+      ],
+    );
+
+    return result.rows.map((row) => ({
+      left: {
+        qaId: Number(row.left_qa_id),
+        code: row.left_code,
+        standardQuestion: row.left_standard_question,
+        similarQuestions: row.left_similar_questions || '',
+        answer: row.left_answer,
+        audience: row.left_audience,
+        categoryPath: row.left_category_path,
+        indexType: row.left_index_type,
+        indexText: row.left_index_text,
+      },
+      right: {
+        qaId: Number(row.right_qa_id),
+        code: row.right_code,
+        standardQuestion: row.right_standard_question,
+        similarQuestions: row.right_similar_questions || '',
+        answer: row.right_answer,
+        audience: row.right_audience,
+        categoryPath: row.right_category_path,
+        indexType: row.right_index_type,
+        indexText: row.right_index_text,
+      },
       score: Number(Number(row.score).toFixed(6)),
     }));
   }
@@ -354,6 +511,10 @@ export class KnowledgeBaseStoreService {
     qa: KbQa,
     builtIndexes: BuiltIndex[],
   ): Promise<void> {
+    if (builtIndexes.length === 0) {
+      throw new BadRequestException('索引生成结果为空，发布已中止');
+    }
+
     for (const builtIndex of builtIndexes) {
       await client.query(
         `

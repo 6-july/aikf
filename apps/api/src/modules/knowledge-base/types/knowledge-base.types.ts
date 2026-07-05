@@ -104,6 +104,42 @@ export interface SearchResult {
   candidates: SearchCandidate[];
 }
 
+export type DuplicateCheckType =
+  | 'standard_question'
+  | 'similar_question_cross'
+  | 'semantic_similarity';
+
+export interface DuplicateCheckItem {
+  qaId: number;
+  code: string;
+  standardQuestion: string;
+  audience: string;
+  categoryPath?: string;
+  similarQuestions: string;
+  answer: string;
+  matchedText?: string;
+  matchedIndexType?: IndexType;
+}
+
+export interface DuplicateCheckGroup {
+  id: string;
+  type: DuplicateCheckType;
+  reason: string;
+  matchedText: string;
+  score?: number;
+  items: DuplicateCheckItem[];
+}
+
+export interface DuplicateCheckResult {
+  totalGroups: number;
+  groups: DuplicateCheckGroup[];
+  config: {
+    audience: string;
+    minScore: number;
+    limit: number;
+  };
+}
+
 export interface ImportQaError {
   row: number;
   message: string;
