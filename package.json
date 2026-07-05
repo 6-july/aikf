@@ -1,0 +1,32 @@
+{
+  "name": "uu-runner-ai-customer-service",
+  "private": true,
+  "packageManager": "pnpm@9.15.0",
+  "scripts": {
+    "db:up": "docker compose up -d postgres",
+    "db:down": "docker compose down",
+    "db:migrate": "node scripts/db-migrate.js",
+    "db:set-embedding-dimension": "node scripts/db-set-embedding-dimension.js",
+    "db:psql": "docker compose exec postgres psql -U uu_runner -d uu_runner_ai_cs",
+    "embedding:probe": "node scripts/embedding-probe.js",
+    "dev:api": "pnpm --filter @uu-runner/api start:dev",
+    "dev:admin": "pnpm --filter @uu-runner/admin dev",
+    "build:api": "pnpm --filter @uu-runner/api build",
+    "build:admin": "pnpm --filter @uu-runner/admin build",
+    "start:api": "pnpm --filter @uu-runner/api start",
+    "lint": "pnpm -r lint",
+    "test": "pnpm -r test"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "dotenv": "^16.4.7",
+    "pg": "^8.13.1",
+    "prettier": "^3.4.2",
+    "typescript": "^5.7.2",
+    "undici": "5.28.5"
+  }
+}
