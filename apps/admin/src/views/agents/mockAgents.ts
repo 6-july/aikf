@@ -1,0 +1,97 @@
+import {
+  BadgeCheck,
+  BookOpenCheck,
+  CreditCard,
+  FileSearch,
+  Headphones,
+  ReceiptText,
+  ShieldCheck,
+  UserRoundCheck,
+} from 'lucide-react';
+import type { AgentPreset } from './types';
+
+export const agentPresets: AgentPreset[] = [
+  {
+    id: 'runner-service',
+    name: '跑男客服',
+    description: '面向签约跑男，处理注册、接单、账户、费用、认证等问题。',
+    status: 'published',
+    hasDraft: false,
+    audience: '跑男 / 通用',
+    model: 'Doubao Pro 32K',
+    updatedAt: '2026-07-05 15:40',
+    publishedAt: '2026-07-05 15:40',
+    systemPrompt:
+      '你是 UU 跑腿跑男客服助手。回答必须准确、克制，优先使用知识库和业务工具；涉及账户、订单、认证等个人信息时必须调用对应工具确认。',
+    openingMessage: '您好，我是智能小 U，请问有什么可以帮您？',
+    fallbackMessage: '这个问题我需要进一步确认，已为您转人工处理。',
+    tools: [
+      { name: '知识库检索', description: '查询跑男制度、流程、费用和常见问题。', enabled: true, icon: BookOpenCheck },
+      { name: '账户信息查询', description: '查询跑男账户状态、余额、基础资料。', enabled: true, icon: CreditCard },
+      { name: '实名认证查询', description: '查询实名、培训、签约等认证进度。', enabled: true, icon: ShieldCheck },
+      { name: '订单查询', description: '查询订单状态、取消原因、费用明细。', enabled: true, icon: ReceiptText },
+      { name: '转人工', description: '低置信度、投诉、复杂争议时转人工。', enabled: true, icon: Headphones },
+    ],
+    debugSteps: [
+      { label: '用户问题', value: '我注册完多久可以开始接单？' },
+      { label: 'Agent 判断', value: '需要查询知识库，问题属于跑男注册流程。' },
+      { label: 'Tool 调用', value: 'search_knowledge_base(query: 注册跑男审核通过后多久可以接单)' },
+      { label: '最终回复', value: '完成实名认证、培训考试和签约后即可开始接单，具体以跑男端页面提示为准。' },
+    ],
+  },
+  {
+    id: 'user-service',
+    name: '用户客服',
+    description: '面向下单用户，处理下单、支付、取消、退款和订单问题。',
+    status: 'published',
+    hasDraft: false,
+    audience: '用户 / 通用',
+    model: 'Doubao Lite 32K',
+    updatedAt: '2026-07-04 18:12',
+    publishedAt: '2026-07-04 18:12',
+    systemPrompt:
+      '你是 UU 跑腿用户客服助手。优先解决下单、支付、订单和退款问题；涉及订单状态必须调用订单工具确认。',
+    openingMessage: '您好，我是智能小 U，请描述您的订单问题。',
+    fallbackMessage: '我暂时无法确认该订单情况，已为您转人工处理。',
+    tools: [
+      { name: '知识库检索', description: '查询用户侧下单、支付、退款和规则说明。', enabled: true, icon: BookOpenCheck },
+      { name: '订单查询', description: '查询订单状态、跑男位置、取消原因。', enabled: true, icon: ReceiptText },
+      { name: '账户信息查询', description: '查询用户账户、优惠券、钱包基础信息。', enabled: true, icon: CreditCard },
+      { name: '材料核验', description: '辅助核验申诉、退款、异常订单材料。', enabled: false, icon: FileSearch },
+      { name: '转人工', description: '投诉、赔付、复杂争议时转人工。', enabled: true, icon: Headphones },
+    ],
+    debugSteps: [
+      { label: '用户问题', value: '订单取消了钱怎么退？' },
+      { label: 'Agent 判断', value: '需要先查订单状态，再结合退款规则回答。' },
+      { label: 'Tool 调用', value: 'get_order_detail(orderId)' },
+      { label: '最终回复', value: '系统会根据订单状态原路退回，到账时间以支付渠道为准。' },
+    ],
+  },
+  {
+    id: 'merchant-service',
+    name: '商家客服',
+    description: '面向商家，处理发单、对账、配送异常和合作问题。',
+    status: 'unpublished',
+    hasDraft: true,
+    audience: '商家 / 通用',
+    model: '未配置',
+    updatedAt: '待配置',
+    draftUpdatedAt: '待配置',
+    systemPrompt:
+      '你是 UU 跑腿商家客服助手。当前智能体尚未启用，后续用于处理商家发单、结算、异常配送等问题。',
+    openingMessage: '您好，请描述您的商家服务问题。',
+    fallbackMessage: '该问题已转人工处理。',
+    tools: [
+      { name: '知识库检索', description: '查询商家发单、结算和配送规则。', enabled: false, icon: BookOpenCheck },
+      { name: '商家认证', description: '查询商家主体认证和合作状态。', enabled: false, icon: BadgeCheck },
+      { name: '联系人查询', description: '查询商家门店和联系人基础信息。', enabled: false, icon: UserRoundCheck },
+      { name: '转人工', description: '商家合作和异常问题转人工。', enabled: true, icon: Headphones },
+    ],
+    debugSteps: [
+      { label: '用户问题', value: '门店怎么开通跑腿配送？' },
+      { label: 'Agent 判断', value: '当前智能体未启用，仅展示调试占位。' },
+      { label: 'Tool 调用', value: '无' },
+      { label: '最终回复', value: '请联系商家运营或人工客服完成开通。' },
+    ],
+  },
+];
